@@ -1,0 +1,220 @@
+package webemr.analytics.cmsdata.service;
+
+import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
+import org.apache.poi.openxml4j.exceptions.InvalidOperationException;
+import org.apache.poi.openxml4j.exceptions.NotOfficeXmlFileException;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import webemr.analytics.cmsdata.constants.ExcelConstants;
+import webemr.analytics.cmsdata.dao.ExcelToTableDao;
+import webemr.analytics.cmsdata.exception.InvalidExcelException;
+import webemr.analytics.cmsdata.model.CMS;
+import webemr.analytics.cmsdata.model.CMSData;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import static webemr.analytics.cmsdata.constants.ExcelConstants.UDS_FILE_LIST;
+
+public class ExcelToTableService {
+
+    private final ExcelToTableDao excelToTableDao = new ExcelToTableDao();
+    private static final Logger LOGGER = LoggerFactory.getLogger(ExcelToTableService.class);
+    private static final List<String> lstExcludedCodeSystem= new ArrayList<>();
+    static {
+        lstExcludedCodeSystem.add(ExcelConstants.SOP_CODE_SYSTEM);
+        lstExcludedCodeSystem.add(ExcelConstants.CDCREC_CODE_SYSTEM);
+        lstExcludedCodeSystem.add(ExcelConstants.AG_CODE_SYSTEM);
+        lstExcludedCodeSystem.add(ExcelConstants.CVX_CODE_SYSTEM);
+        lstExcludedCodeSystem.add(ExcelConstants.SNOMEDCT_CODE_SYSTEM);
+    }
+    /**
+     * Method is used to upload Excel file.
+     */
+    public Map<String, String> parseFile(String directoryPath) {
+        LOGGER.info("Starting method execution : parseFile");
+        Map<String, String> resultmap = new HashMap<>();
+        if (!Files.exists(Paths.get(directoryPath))) {
+            resultmap.put(ExcelConstants.MESSAGE, ExcelConstants.UPLOAD_FAIL_DIRECTORY_NOT_FOUND);
+            resultmap.put(ExcelConstants.STATUS, ExcelConstants.DIRECTORY_NOT_FOUND_STATUS);
+            return resultmap;
+        }
+        try {
+            Map<String, List<CMSData>> cmsDataMap = readExcelFile(directoryPath);
+            if (insertData(cmsDataMap)) {
+                resultmap.put(ExcelConstants.MESSAGE, ExcelConstants.UPLOAD_SUCCESSFULLY);
+                resultmap.put(ExcelConstants.STATUS, ExcelConstants.SUCCESS_STATUS);
+            }
+        } catch (InvalidExcelException ex) {
+            LOGGER.error(ex.getMessage(), ex);
+            resultmap.put(ExcelConstants.MESSAGE, ex.getMessage());
+            resultmap.put(ExcelConstants.STATUS, ExcelConstants.FAIL_STATUS);
+            return resultmap;
+        } finally {
+            excelToTableDao.closeConnection();
+        }
+        LOGGER.info("Completed method execution : parseFile");
+        return resultmap;
+    }
+
+    private Map<String, List<CMSData>> readExcelFile(String directoryPath) {
+        LOGGER.info("Starting method execution : readExcelFile");
+        Map<String, List<CMSData>> cmsDataMap = new LinkedHashMap<>();
+        try (Stream<Path> filePathList = Files.list(Paths.get(directoryPath)).
+                filter(filePath -> UDS_FILE_LIST.contains(filePath.getFileName().toString())).sorted(Comparator.comparing(Path::getFileName))) {
+            filePathList.forEach(filePath -> {
+                OPCPackage excelFileLocation = getOpcPackage(filePath);
+                Workbook workbook = getWorkbook(excelFileLocation);
+                Sheet sheet = workbook.getSheetAt(0);
+                List<CMSData> cmsDataList = new ArrayList<>();
+                DataFormatter formatter = new DataFormatter();
+                for(int rowIndex = ExcelConstants.ROW_INDEX;rowIndex <=sheet.getLastRowNum();rowIndex++){
+                    Row row = sheet.getRow(rowIndex);
+
+                    CMSData cmsData = new CMSData();
+                    int cellIndex = 0;
+                    cellIndex = getEligibleCell(sheet, cellIndex);
+
+                    if(row.getCell(cellIndex)!=null){
+
+                        cmsData.setcMSID(formatter.formatCellValue(row.getCell(cellIndex)));
+                        cellIndex=cellIndex+1;
+
+                        cellIndex = getEligibleCell(sheet, cellIndex);
+
+                        cmsData.setValueSetName(formatter.formatCellValue(row.getCell(cellIndex)));
+                        cellIndex=cellIndex+1;
+
+                        cellIndex = getEligibleCell(sheet, cellIndex);
+
+                        cmsData.setqDMCategory(formatter.formatCellValue(row.getCell(cellIndex)));
+                        cellIndex=cellIndex+1;
+
+                        cellIndex = getEligibleCell(sheet, cellIndex);
+
+                        cmsData.setCode(formatter.formatCellValue(row.getCell(cellIndex)));
+                        cellIndex=cellIndex+1;
+
+                        cellIndex = getEligibleCell(sheet, cellIndex);
+
+                        cmsData.setDescription(formatter.formatCellValue(row.getCell(cellIndex)));
+                        cellIndex=cellIndex+1;
+
+                        cellIndex = getEligibleCell(sheet, cellIndex);
+
+                        cmsData.setCodeSystem(formatter.formatCellValue(row.getCell(cellIndex)));
+
+                        if(!lstExcludedCodeSystem.contains(cmsData.getCodeSystem())){
+                            cmsDataList.add(cmsData);
+                        }
+                    }
+                }
+                addItemIdInserts(cmsDataList);
+                cmsDataMap.put(sheet.getSheetName(), cmsDataList);
+                closeWorkbook(workbook);
+            });
+
+        } catch (NotOfficeXmlFileException | InvalidExcelException | IOException e) {
+            throw new InvalidExcelException(ExcelConstants.INVALID_EXCEL_EX + " : " + e.getMessage());
+        }
+        LOGGER.info("Completed method execution : readExcelFile");
+        return cmsDataMap;
+    }
+
+    private void closeWorkbook(Workbook workbook) {
+        try {
+            if(workbook != null) {
+                workbook.close();
+            }
+        } catch (IOException e) {
+            LOGGER.error(ExcelConstants.INVALID_EXCEL_EX + " : " + e.getMessage());
+        }
+    }
+
+    private OPCPackage getOpcPackage(Path filePath) {
+        OPCPackage excelFileLocation;
+        try {
+            excelFileLocation = OPCPackage.open(new File(filePath.toString()));
+        } catch (InvalidOperationException | InvalidFormatException e) {
+            throw new InvalidExcelException(ExcelConstants.INVALID_EXCEL_EX + " : " + e.getMessage());
+        }
+        return excelFileLocation;
+    }
+
+    private void addItemIdInserts(List<CMSData> cmsDataList ){
+
+        List<Integer> lstItemid;
+        List<CMSData>cmsDataAfterAddition= new ArrayList<>();
+        for(CMSData cmsData : cmsDataList){
+            int counter=0;
+            CMSData newCmsData;
+            lstItemid=excelToTableDao.getItemIdsForCode(cmsData);
+            for(Integer itemid : lstItemid){
+                if(counter==0){
+                    cmsData.setItemId(itemid);
+                }else{
+                    newCmsData= (CMSData)cmsData.clone();
+                    newCmsData.setItemId(itemid);
+                    cmsDataAfterAddition.add(newCmsData);
+                }
+                counter++;
+
+            }
+        }
+        cmsDataList.addAll(cmsDataAfterAddition);
+        LOGGER.info("Completed method execution : addItemIdInserts");
+    }
+
+    private int getEligibleCell(Sheet sheet, int cellIndex) {
+        LOGGER.info("Starting method execution : getEligibleCell");
+        while (sheet.isColumnHidden(cellIndex)) {
+            cellIndex=cellIndex+1;
+        }
+        LOGGER.info("Completed method execution : getEligibleCell");
+        return cellIndex;
+    }
+
+    private Workbook getWorkbook(OPCPackage excelFileLocation){
+        LOGGER.info("Starting method execution : getWorkbook");
+        Workbook workbook;
+        try{
+            workbook = new XSSFWorkbook(excelFileLocation);
+        }catch (NotOfficeXmlFileException | IOException ex){
+            throw new InvalidExcelException(ExcelConstants.ILLEGAL_ARGUMENT);
+        }
+        LOGGER.info("Completed method execution : getWorkbook");
+        return workbook;
+    }
+
+    /**
+     * Method is used to insert data.
+     */
+    private boolean insertData(Map<String,List<CMSData>> cmsDataMap){
+        LOGGER.info("Starting method execution : insertData");
+        Boolean isInsert = false;
+        excelToTableDao.insertCategoriesData(cmsDataMap);
+        List<CMS> cmsList = excelToTableDao.getCMSList();
+        if(cmsList != null){
+            isInsert = excelToTableDao.insertInBatchCMSData(cmsDataMap, cmsList);
+        }
+        LOGGER.info("Completed method execution : insertData");
+        return isInsert;
+    }
+
+}
